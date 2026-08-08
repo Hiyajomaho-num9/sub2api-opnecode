@@ -53,6 +53,54 @@ func TestUsageConversionsPreserveCacheWriteTokens(t *testing.T) {
 	require.Equal(t, 200, roundTrip.InputTokensDetails.CacheWriteTokens)
 }
 
+func TestChatUsageToResponsesUsagePreservesTokenDetails(t *testing.T) {
+	usage := &ChatUsage{
+		PromptTokens:     109,
+		CompletionTokens: 13,
+		TotalTokens:      122,
+		PromptTokensDetails: &ChatTokenDetails{
+			CachedTokens:        7,
+			AudioTokens:         2,
+			CacheCreationTokens: 3,
+		},
+		CompletionTokensDetails: &ChatTokenDetails{
+			ReasoningTokens:          11,
+			AudioTokens:              1,
+			AcceptedPredictionTokens: 4,
+			RejectedPredictionTokens: 2,
+		},
+	}
+
+	got := ChatUsageToResponsesUsage(usage)
+	require.NotNil(t, got)
+	require.Equal(t, 109, got.InputTokens)
+	require.Equal(t, 13, got.OutputTokens)
+	require.Equal(t, 122, got.TotalTokens)
+	require.NotNil(t, got.InputTokensDetails)
+	require.Equal(t, 7, got.InputTokensDetails.CachedTokens)
+	require.Equal(t, 2, got.InputTokensDetails.AudioTokens)
+	require.Equal(t, 3, got.InputTokensDetails.CacheCreationTokens)
+	require.NotNil(t, got.OutputTokensDetails)
+	require.Equal(t, 11, got.OutputTokensDetails.ReasoningTokens)
+	require.Equal(t, 1, got.OutputTokensDetails.AudioTokens)
+	require.Equal(t, 4, got.OutputTokensDetails.AcceptedPredictionTokens)
+	require.Equal(t, 2, got.OutputTokensDetails.RejectedPredictionTokens)
+}
+
+func TestChatUsageToResponsesUsageOmitsEmptyTokenDetails(t *testing.T) {
+	got := ChatUsageToResponsesUsage(&ChatUsage{
+		PromptTokens:            2,
+		CompletionTokens:        1,
+		PromptTokensDetails:     &ChatTokenDetails{},
+		CompletionTokensDetails: &ChatTokenDetails{},
+	})
+
+	require.NotNil(t, got)
+	require.Equal(t, 3, got.TotalTokens)
+	require.Nil(t, got.InputTokensDetails)
+	require.Nil(t, got.OutputTokensDetails)
+}
+
 func TestResponsesUsageNestedCacheWritePresenceOverridesTopLevelAlias(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -442,7 +490,7 @@ func TestChatCompletionsToResponses_EmptyContentNeverNull(t *testing.T) {
 	}
 }
 
-func TestChatCompletionsResponseToResponses_DeepSeekReasoningOnlyFallsBackToMessageText(t *testing.T) {
+func TestChatCompletionsResponseToResponses_DeepSeekReasoningOnlyStaysOutOfMessageText(t *testing.T) {
 	content := json.RawMessage(`""`)
 	resp := &ChatCompletionsResponse{
 		ID:     "chatcmpl_deepseek_reasoning_only",
@@ -465,7 +513,8 @@ func TestChatCompletionsResponseToResponses_DeepSeekReasoningOnlyFallsBackToMess
 	require.Equal(t, "reasoning", out.Output[0].Type)
 	require.Equal(t, "message", out.Output[1].Type)
 	require.Len(t, out.Output[1].Content, 1)
-	assert.Equal(t, "reasoning-only answer", out.Output[1].Content[0].Text)
+	assert.Equal(t, "reasoning-only answer", out.Output[0].Summary[0].Text)
+	assert.Empty(t, out.Output[1].Content[0].Text)
 }
 
 func TestChatCompletionsResponseToResponses_DeepSeekReasoningToolCallDoesNotFallbackToMessageText(t *testing.T) {

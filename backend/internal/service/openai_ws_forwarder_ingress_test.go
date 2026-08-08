@@ -836,6 +836,98 @@ func TestBuildOpenAIWSReplayInputSequence(t *testing.T) {
 		require.Equal(t, "hello", gjson.GetBytes(items[0], "text").String())
 		require.Equal(t, "world", gjson.GetBytes(items[1], "text").String())
 	})
+
+	t.Run("overlapping_tool_context_keeps_one_call_and_appends_output", func(t *testing.T) {
+		previous := []json.RawMessage{
+			json.RawMessage(`{"type":"reasoning","id":"rs_2","summary":[{"type":"summary_text","text":"second reasoning"}]}`),
+			json.RawMessage(`{"type":"function_call","id":"fc_stream","call_id":"call_2","name":"shell","arguments":"{}","status":"in_progress"}`),
+		}
+		items, exists, err := buildOpenAIWSReplayInputSequence(
+			previous,
+			true,
+			[]byte(`{"previous_response_id":"resp_2","input":[{"type":"function_call","id":"fc_completed","call_id":"call_2","name":"shell","arguments":"{}","status":"completed"},{"type":"function_call_output","call_id":"call_2","output":"ok"}]}`),
+			true,
+		)
+		require.NoError(t, err)
+		require.True(t, exists)
+		require.Len(t, items, 3)
+		require.Equal(t, []string{"reasoning", "function_call", "function_call_output"}, []string{
+			gjson.GetBytes(items[0], "type").String(),
+			gjson.GetBytes(items[1], "type").String(),
+			gjson.GetBytes(items[2], "type").String(),
+		})
+		require.Equal(t, "fc_stream", gjson.GetBytes(items[1], "id").String(), "first complete call context wins")
+	})
+
+	t.Run("partial_rolling_history_deduplicates_replay_items", func(t *testing.T) {
+		previous := []json.RawMessage{
+			json.RawMessage(`{"type":"function_call","call_id":"call_1","name":"shell","arguments":"{}"}`),
+			json.RawMessage(`{"type":"function_call_output","call_id":"call_1","output":"one"}`),
+			json.RawMessage(`{"type":"reasoning","id":"rs_2","summary":[{"type":"summary_text","text":"next"}]}`),
+			json.RawMessage(`{"type":"function_call","call_id":"call_2","name":"shell","arguments":"{}"}`),
+		}
+		items, exists, err := buildOpenAIWSReplayInputSequence(
+			previous,
+			true,
+			[]byte(`{"previous_response_id":"resp_2","input":[{"type":"function_call","call_id":"call_1","name":"shell","arguments":"{}"},{"type":"function_call_output","call_id":"call_1","output":"one"},{"type":"function_call","call_id":"call_2","name":"shell","arguments":"{}"},{"type":"function_call_output","call_id":"call_2","output":"two"}]}`),
+			true,
+		)
+		require.NoError(t, err)
+		require.True(t, exists)
+		require.Len(t, items, 5)
+		for _, callID := range []string{"call_1", "call_2"} {
+			var contexts, outputs int
+			for _, item := range items {
+				if gjson.GetBytes(item, "call_id").String() != callID {
+					continue
+				}
+				switch gjson.GetBytes(item, "type").String() {
+				case "function_call":
+					contexts++
+				case "function_call_output":
+					outputs++
+				}
+			}
+			require.Equal(t, 1, contexts)
+			require.Equal(t, 1, outputs)
+		}
+	})
+
+	t.Run("different_call_ids_are_not_deduplicated", func(t *testing.T) {
+		previous := []json.RawMessage{
+			json.RawMessage(`{"type":"function_call","call_id":"call_1","name":"shell","arguments":"{}"}`),
+		}
+		items, exists, err := buildOpenAIWSReplayInputSequence(
+			previous,
+			true,
+			[]byte(`{"previous_response_id":"resp_1","input":[{"type":"function_call","call_id":"call_2","name":"shell","arguments":"{}"}]}`),
+			true,
+		)
+		require.NoError(t, err)
+		require.True(t, exists)
+		require.Len(t, items, 2)
+		require.Equal(t, "call_1", gjson.GetBytes(items[0], "call_id").String())
+		require.Equal(t, "call_2", gjson.GetBytes(items[1], "call_id").String())
+	})
+
+	t.Run("identical_user_message_in_next_delta_is_not_overlap", func(t *testing.T) {
+		previous := []json.RawMessage{
+			json.RawMessage(`{"type":"message","role":"user","content":"first"}`),
+			json.RawMessage(`{"type":"message","role":"user","content":"yes"}`),
+		}
+		items, exists, err := buildOpenAIWSReplayInputSequence(
+			previous,
+			true,
+			[]byte(`{"previous_response_id":"resp_1","input":[{"type":"message","role":"user","content":"yes"}]}`),
+			true,
+		)
+		require.NoError(t, err)
+		require.True(t, exists)
+		require.Len(t, items, 3)
+		require.Equal(t, "first", gjson.GetBytes(items[0], "content").String())
+		require.Equal(t, "yes", gjson.GetBytes(items[1], "content").String())
+		require.Equal(t, "yes", gjson.GetBytes(items[2], "content").String())
+	})
 }
 
 func TestOpenAIWSRawPayloadHasToolCallOutput(t *testing.T) {

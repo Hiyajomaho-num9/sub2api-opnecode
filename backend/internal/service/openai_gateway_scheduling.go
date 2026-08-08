@@ -296,6 +296,9 @@ func openAICompactSupportTier(account *Account) int {
 	if !account.IsOpenAI() {
 		return 0
 	}
+	if account.SupportsLocalOpenAICompactBridge() {
+		return 2
+	}
 	supported, known := account.OpenAICompactSupportKnown()
 	if !known {
 		return 1

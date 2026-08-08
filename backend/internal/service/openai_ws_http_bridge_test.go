@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/apicompat"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/xai"
 	coderws "github.com/coder/websocket"
 	"github.com/gin-gonic/gin"
@@ -60,6 +62,104 @@ func TestOpenAIWSHTTPBridgeDecisionKeepsSmallFramesOnWS(t *testing.T) {
 	svc.cfg.Gateway.OpenAIWS.HTTPBridgeEnabled = false
 	require.False(t, svc.shouldBridgeOpenAIWSHTTP(nil, 1000, ""))
 	require.True(t, svc.shouldBridgeOpenAIWSHTTP(&Account{Platform: PlatformGrok}, 1, "resp_existing"))
+}
+
+func TestOpenAIWSToolCallReplayCollectorPreservesReasoningAndDeduplicatesTerminalOutput(t *testing.T) {
+	const reasoning = "inspect the workspace, then run the command exactly"
+	collector := &openAIWSToolCallReplayCollector{}
+	collector.AddEvent("response.output_item.done", []byte(`{
+		"type":"response.output_item.done",
+		"item":{"type":"reasoning","id":"rs_stream","summary":[{"type":"summary_text","text":"`+reasoning+`"}]}
+	}`))
+	collector.AddEvent("response.output_item.done", []byte(`{
+		"type":"response.output_item.done",
+		"item":{"type":"function_call","id":"fc_stream","call_id":"call_a","name":"exec_command","arguments":"{}","status":"completed"}
+	}`))
+	collector.AddEvent("response.completed", []byte(`{
+		"type":"response.completed",
+		"response":{"output":[
+			{"type":"reasoning","id":"rs_stream","summary":[{"type":"summary_text","text":"`+reasoning+`"}]},
+			{"type":"function_call","id":"fc_completed","call_id":"call_a","name":"exec_command","arguments":"{}","status":"completed"}
+		]}
+	}`))
+
+	replay := collector.Items()
+	require.Len(t, replay, 2)
+	require.Equal(t, "reasoning", gjson.GetBytes(replay[0], "type").String())
+	require.Equal(t, reasoning, gjson.GetBytes(replay[0], "summary.0.text").String())
+	require.Equal(t, "function_call", gjson.GetBytes(replay[1], "type").String())
+	require.Equal(t, "call_a", gjson.GetBytes(replay[1], "call_id").String())
+	require.Equal(t, "fc_stream", gjson.GetBytes(replay[1], "id").String())
+}
+
+func TestOpenAIWSReplaySequentialToolsPreserveEachReasoningExactlyOnce(t *testing.T) {
+	firstCollector := &openAIWSToolCallReplayCollector{}
+	firstCollector.AddEvent("response.output_item.done", []byte(`{
+		"item":{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"first exact reasoning"}]}
+	}`))
+	firstCollector.AddEvent("response.output_item.done", []byte(`{
+		"item":{"type":"function_call","id":"fc_1_stream","call_id":"call_1","name":"exec","arguments":"{}","status":"completed"}
+	}`))
+	firstCollector.AddEvent("response.completed", []byte(`{
+		"response":{"output":[
+			{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"first exact reasoning"}]},
+			{"type":"function_call","id":"fc_1_terminal","call_id":"call_1","name":"exec","arguments":"{}","status":"completed"}
+		]}
+	}`))
+
+	fullInput := []json.RawMessage{json.RawMessage(`{"type":"message","role":"user","content":"run twice"}`)}
+	fullInput = append(fullInput, firstCollector.Items()...)
+	turnTwoInput, exists, err := buildOpenAIWSReplayInputSequence(
+		fullInput,
+		true,
+		[]byte(`{"previous_response_id":"resp_1","input":[{"type":"function_call","id":"fc_1_client","call_id":"call_1","name":"exec","arguments":"{}"},{"type":"function_call_output","call_id":"call_1","output":"one"}]}`),
+		true,
+	)
+	require.NoError(t, err)
+	require.True(t, exists)
+
+	secondCollector := &openAIWSToolCallReplayCollector{}
+	secondCollector.AddEvent("response.output_item.done", []byte(`{
+		"item":{"type":"reasoning","id":"rs_2","summary":[{"type":"summary_text","text":"second exact reasoning"}]}
+	}`))
+	secondCollector.AddEvent("response.output_item.done", []byte(`{
+		"item":{"type":"function_call","id":"fc_2_stream","call_id":"call_2","name":"exec","arguments":"{}","status":"completed"}
+	}`))
+	fullInput = append(turnTwoInput, secondCollector.Items()...)
+	turnThreeInput, exists, err := buildOpenAIWSReplayInputSequence(
+		fullInput,
+		true,
+		[]byte(`{"previous_response_id":"resp_2","input":[{"type":"function_call","id":"fc_2_client","call_id":"call_2","name":"exec","arguments":"{}"},{"type":"function_call_output","call_id":"call_2","output":"two"}]}`),
+		true,
+	)
+	require.NoError(t, err)
+	require.True(t, exists)
+
+	input, err := json.Marshal(turnThreeInput)
+	require.NoError(t, err)
+	chatReq, err := apicompat.ResponsesToChatCompletionsRequest(&apicompat.ResponsesRequest{
+		Model: "deepseek-v4-flash",
+		Input: input,
+	})
+	require.NoError(t, err)
+
+	var reasoning []string
+	callCounts := map[string]int{}
+	replyCounts := map[string]int{}
+	for _, message := range chatReq.Messages {
+		if len(message.ToolCalls) > 0 {
+			reasoning = append(reasoning, message.ReasoningContent)
+		}
+		for _, call := range message.ToolCalls {
+			callCounts[call.ID]++
+		}
+		if message.Role == "tool" {
+			replyCounts[message.ToolCallID]++
+		}
+	}
+	require.Equal(t, []string{"first exact reasoning", "second exact reasoning"}, reasoning)
+	require.Equal(t, map[string]int{"call_1": 1, "call_2": 1}, callCounts)
+	require.Equal(t, map[string]int{"call_1": 1, "call_2": 1}, replyCounts)
 }
 
 func TestProxyOpenAIWSHTTPBridgeTurnTransportErrorFailoverSafety(t *testing.T) {

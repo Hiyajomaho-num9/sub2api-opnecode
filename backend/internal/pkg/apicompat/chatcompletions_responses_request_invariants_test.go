@@ -185,3 +185,54 @@ func TestNormalize_DropsOrphanToolReply(t *testing.T) {
 		require.NotEqualf(t, "tool", m.Role, "orphan tool reply should have been dropped")
 	}
 }
+
+func TestRequest_SequentialToolCallsPreserveEachReasoningContent(t *testing.T) {
+	msgs := convertGolden(t, `[
+		{"type":"message","role":"user","content":[{"type":"input_text","text":"run twice"}]},
+		{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"first exact reasoning"}]},
+		{"type":"function_call","id":"fc_1","call_id":"c1","name":"exec","arguments":"{}"},
+		{"type":"function_call_output","call_id":"c1","output":"r1"},
+		{"type":"reasoning","id":"rs_2","summary":[{"type":"summary_text","text":"second exact reasoning"}]},
+		{"type":"function_call","id":"fc_2","call_id":"c2","name":"exec","arguments":"{}"},
+		{"type":"function_call_output","call_id":"c2","output":"r2"}
+	]`)
+	assertChatInvariants(t, msgs)
+
+	var reasoning []string
+	var callIDs []string
+	for _, message := range msgs {
+		if len(message.ToolCalls) == 0 {
+			continue
+		}
+		reasoning = append(reasoning, message.ReasoningContent)
+		callIDs = append(callIDs, message.ToolCalls[0].ID)
+	}
+	require.Equal(t, []string{"first exact reasoning", "second exact reasoning"}, reasoning)
+	require.Equal(t, []string{"c1", "c2"}, callIDs)
+}
+
+func TestNormalize_DeduplicatesRepeatedToolCallID(t *testing.T) {
+	msgs := convertGolden(t, `[
+		{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"exact reasoning"}]},
+		{"type":"function_call","id":"fc_stream","call_id":"call_a","name":"exec","arguments":"{}","status":"in_progress"},
+		{"type":"function_call_output","call_id":"call_a","output":"old"},
+		{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"exact reasoning"}]},
+		{"type":"function_call","id":"fc_completed","call_id":"call_a","name":"exec","arguments":"{}","status":"completed"},
+		{"type":"function_call_output","call_id":"call_a","output":"new"}
+	]`)
+	assertChatInvariants(t, msgs)
+
+	var assistantCalls, toolReplies int
+	for _, message := range msgs {
+		for _, call := range message.ToolCalls {
+			require.Equal(t, "call_a", call.ID)
+			assistantCalls++
+		}
+		if message.Role == "tool" {
+			require.Equal(t, "call_a", message.ToolCallID)
+			toolReplies++
+		}
+	}
+	require.Equal(t, 1, assistantCalls)
+	require.Equal(t, 1, toolReplies)
+}

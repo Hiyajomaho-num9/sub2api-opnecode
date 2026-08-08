@@ -583,6 +583,7 @@ func normalizeChatMessagesWithToolOutputMedia(messages []ChatMessage, mediaByCal
 	}
 
 	out := make([]ChatMessage, 0, len(messages))
+	emittedCallIDs := make(map[string]struct{})
 	for _, m := range messages {
 		switch {
 		case m.Role == "tool":
@@ -601,8 +602,12 @@ func normalizeChatMessagesWithToolOutputMedia(messages []ChatMessage, mediaByCal
 				if tc.ID == "" {
 					continue
 				}
+				if _, emitted := emittedCallIDs[tc.ID]; emitted {
+					continue
+				}
 				if _, ok := replies[tc.ID]; ok {
 					kept = append(kept, tc)
+					emittedCallIDs[tc.ID] = struct{}{}
 				}
 			}
 			if len(kept) == 0 {
@@ -1065,9 +1070,6 @@ func chatMessageToResponsesOutput(message ChatMessage, customTools map[string]bo
 	}
 
 	text := chatMessageContentText(message.Content)
-	if text == "" && strings.TrimSpace(message.ReasoningContent) != "" && len(message.ToolCalls) == 0 {
-		text = message.ReasoningContent
-	}
 	if text != "" || len(message.ToolCalls) == 0 {
 		outputs = append(outputs, ResponsesOutput{
 			Type: "message",
@@ -1194,9 +1196,11 @@ func ChatUsageToResponsesUsage(usage *ChatUsage) *ResponsesUsage {
 		out.TotalTokens = out.InputTokens + out.OutputTokens
 	}
 	if usage.PromptTokensDetails != nil && (usage.PromptTokensDetails.CachedTokens > 0 ||
-		usage.PromptTokensDetails.CacheCreationTokens > 0 || usage.PromptTokensDetails.CacheWriteTokens > 0) {
+		usage.PromptTokensDetails.AudioTokens > 0 || usage.PromptTokensDetails.CacheCreationTokens > 0 ||
+		usage.PromptTokensDetails.CacheWriteTokens > 0) {
 		out.InputTokensDetails = &ResponsesInputTokensDetails{
 			CachedTokens:        usage.PromptTokensDetails.CachedTokens,
+			AudioTokens:         usage.PromptTokensDetails.AudioTokens,
 			CacheCreationTokens: usage.PromptTokensDetails.CacheCreationTokens,
 			CacheWriteTokens:    usage.PromptTokensDetails.CacheWriteTokens,
 		}
@@ -1204,6 +1208,16 @@ func ChatUsageToResponsesUsage(usage *ChatUsage) *ResponsesUsage {
 			out.CacheCreationInputTokens = usage.PromptTokensDetails.CacheWriteTokens
 		} else {
 			out.CacheCreationInputTokens = usage.PromptTokensDetails.CacheCreationTokens
+		}
+	}
+	if usage.CompletionTokensDetails != nil && (usage.CompletionTokensDetails.ReasoningTokens > 0 ||
+		usage.CompletionTokensDetails.AudioTokens > 0 || usage.CompletionTokensDetails.AcceptedPredictionTokens > 0 ||
+		usage.CompletionTokensDetails.RejectedPredictionTokens > 0) {
+		out.OutputTokensDetails = &ResponsesOutputTokensDetails{
+			ReasoningTokens:          usage.CompletionTokensDetails.ReasoningTokens,
+			AudioTokens:              usage.CompletionTokensDetails.AudioTokens,
+			AcceptedPredictionTokens: usage.CompletionTokensDetails.AcceptedPredictionTokens,
+			RejectedPredictionTokens: usage.CompletionTokensDetails.RejectedPredictionTokens,
 		}
 	}
 	return out
@@ -1420,9 +1434,8 @@ func FinalizeChatCompletionsResponsesStream(state *ChatCompletionsToResponsesStr
 	events = append(events, ensureChatToResponsesCreated(state)...)
 
 	// Close a reasoning item that never transitioned to content (reasoning-only
-	// or empty completion).
+	// or empty completion). Reasoning must never be copied into output_text.
 	events = append(events, closeChatReasoningItem(state)...)
-	events = append(events, synthesizeChatReasoningFallbackMessage(state)...)
 
 	if state.MessageItemID != "" {
 		if state.TextPartOpen {
@@ -1551,33 +1564,6 @@ func closeChatReasoningItem(state *ChatCompletionsToResponsesStreamState) []Resp
 			},
 		}),
 	}
-}
-
-func synthesizeChatReasoningFallbackMessage(state *ChatCompletionsToResponsesStreamState) []ResponsesStreamEvent {
-	if state == nil ||
-		state.MessageItemID != "" ||
-		state.Text.Len() > 0 ||
-		state.Reasoning.Len() == 0 ||
-		len(state.ToolCalls) > 0 {
-		return nil
-	}
-
-	text := state.Reasoning.String()
-	if strings.TrimSpace(text) == "" {
-		return nil
-	}
-
-	var events []ResponsesStreamEvent
-	events = append(events, ensureChatToResponsesMessageItem(state)...)
-	events = append(events, ensureChatToResponsesTextPart(state)...)
-	_, _ = state.Text.WriteString(text)
-	events = append(events, chatToResponsesEvent(state, "response.output_text.delta", &ResponsesStreamEvent{
-		OutputIndex:  state.MessageIndex,
-		ContentIndex: 0,
-		Delta:        text,
-		ItemID:       state.MessageItemID,
-	}))
-	return events
 }
 
 func ensureChatToResponsesMessageItem(state *ChatCompletionsToResponsesStreamState) []ResponsesStreamEvent {
@@ -1777,14 +1763,14 @@ func (state *ChatCompletionsToResponsesStreamState) chatOutput() []ResponsesOutp
 	if state.Reasoning.Len() > 0 {
 		outputs = append(outputs, ResponsesOutput{
 			Type: "reasoning",
-			ID:   generateItemID(),
+			ID:   nonEmpty(state.ReasoningItemID, generateItemID()),
 			Summary: []ResponsesSummary{{
 				Type: "summary_text",
 				Text: state.Reasoning.String(),
 			}},
 		})
 	}
-	if state.MessageItemID != "" || len(state.ToolCalls) == 0 {
+	if state.MessageItemID != "" {
 		outputs = append(outputs, ResponsesOutput{
 			Type: "message",
 			ID:   nonEmpty(state.MessageItemID, generateItemID()),
@@ -1801,6 +1787,7 @@ func (state *ChatCompletionsToResponsesStreamState) chatOutput() []ResponsesOutp
 		if !ok || toolCall == nil {
 			continue
 		}
+		itemID := nonEmpty(state.ToolItemIDs[i], generateItemID())
 		arguments := toolCall.Function.Arguments
 		if strings.TrimSpace(arguments) == "" {
 			arguments = "{}"
@@ -1808,7 +1795,7 @@ func (state *ChatCompletionsToResponsesStreamState) chatOutput() []ResponsesOutp
 		if state.toolIsCustom[i] {
 			outputs = append(outputs, ResponsesOutput{
 				Type:   "custom_tool_call",
-				ID:     generateItemID(),
+				ID:     itemID,
 				CallID: toolCall.ID,
 				Name:   toolCall.Function.Name,
 				Input:  extractCustomToolCallInput(arguments),
@@ -1819,7 +1806,7 @@ func (state *ChatCompletionsToResponsesStreamState) chatOutput() []ResponsesOutp
 		if state.toolIsToolSearch[i] {
 			outputs = append(outputs, ResponsesOutput{
 				Type:      "tool_search_call",
-				ID:        generateItemID(),
+				ID:        itemID,
 				CallID:    toolCall.ID,
 				Arguments: arguments,
 				Status:    "completed",
@@ -1832,7 +1819,7 @@ func (state *ChatCompletionsToResponsesStreamState) chatOutput() []ResponsesOutp
 		}
 		outputs = append(outputs, ResponsesOutput{
 			Type:      "function_call",
-			ID:        generateItemID(),
+			ID:        itemID,
 			CallID:    toolCall.ID,
 			Name:      name,
 			Namespace: namespace,
