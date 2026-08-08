@@ -33,6 +33,26 @@ type updateServiceGitHubClientStub struct {
 	recentErr      error
 }
 
+func TestCompareVersionsIgnoresReleaseSuffixes(t *testing.T) {
+	tests := []struct {
+		name    string
+		current string
+		latest  string
+		want    int
+	}{
+		{name: "rebase equals official", current: "0.1.173-rebase", latest: "v0.1.173", want: 0},
+		{name: "build metadata equals official", current: "0.1.173+local", latest: "0.1.173", want: 0},
+		{name: "older rebase", current: "0.1.172-rebase", latest: "0.1.173", want: -1},
+		{name: "newer official", current: "0.1.174", latest: "0.1.173-rebase", want: 1},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Equal(t, tt.want, compareVersions(tt.current, tt.latest))
+		})
+	}
+}
+
 func (s *updateServiceGitHubClientStub) FetchLatestRelease(context.Context, string) (*GitHubRelease, error) {
 	return s.release, nil
 }
