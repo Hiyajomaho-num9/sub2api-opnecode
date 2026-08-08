@@ -521,7 +521,48 @@ func openAIWSInputIsPrefixExtended(previousPayload, currentPayload []byte) (bool
 	return true, nil
 }
 
-func openAIWSRawItemsHasPrefix(items []json.RawMessage, prefix []json.RawMessage) bool {
+func openAIWSReplayItemDedupKey(raw json.RawMessage) string {
+	itemType := strings.TrimSpace(gjson.GetBytes(raw, "type").String())
+	callID := strings.TrimSpace(gjson.GetBytes(raw, "call_id").String())
+	itemID := strings.TrimSpace(gjson.GetBytes(raw, "id").String())
+
+	switch {
+	case isCodexToolCallContextItemType(itemType):
+		if callID != "" {
+			return "tool_context:" + callID
+		}
+		if itemID != "" {
+			return "tool_context_id:" + itemID
+		}
+	case isCodexToolCallOutputItemType(itemType):
+		if callID != "" {
+			return "tool_output:" + callID
+		}
+		if itemID != "" {
+			return "tool_output_id:" + itemID
+		}
+	case itemType == "reasoning":
+		if itemID != "" {
+			return "reasoning:" + itemID
+		}
+		return "reasoning_json:" + string(normalizeOpenAIWSJSONForCompareOrRaw(raw))
+	}
+	return ""
+}
+
+func openAIWSReplayItemsEquivalent(left, right json.RawMessage) bool {
+	leftKey := openAIWSReplayItemDedupKey(left)
+	rightKey := openAIWSReplayItemDedupKey(right)
+	if leftKey != "" || rightKey != "" {
+		return leftKey != "" && leftKey == rightKey
+	}
+	return bytes.Equal(
+		normalizeOpenAIWSJSONForCompareOrRaw(left),
+		normalizeOpenAIWSJSONForCompareOrRaw(right),
+	)
+}
+
+func openAIWSRawItemsHasPrefix(items, prefix []json.RawMessage) bool {
 	if len(prefix) == 0 {
 		return true
 	}
@@ -529,13 +570,34 @@ func openAIWSRawItemsHasPrefix(items []json.RawMessage, prefix []json.RawMessage
 		return false
 	}
 	for idx := range prefix {
-		previousNormalized := normalizeOpenAIWSJSONForCompareOrRaw(prefix[idx])
-		currentNormalized := normalizeOpenAIWSJSONForCompareOrRaw(items[idx])
-		if !bytes.Equal(previousNormalized, currentNormalized) {
+		if !openAIWSReplayItemsEquivalent(prefix[idx], items[idx]) {
 			return false
 		}
 	}
 	return true
+}
+
+func openAIWSReplayArtifactOverlap(previous, current []json.RawMessage) int {
+	maxOverlap := len(previous)
+	if len(current) < maxOverlap {
+		maxOverlap = len(current)
+	}
+	for overlap := maxOverlap; overlap > 0; overlap-- {
+		matches := true
+		previousStart := len(previous) - overlap
+		for idx := 0; idx < overlap; idx++ {
+			previousKey := openAIWSReplayItemDedupKey(previous[previousStart+idx])
+			currentKey := openAIWSReplayItemDedupKey(current[idx])
+			if previousKey == "" || previousKey != currentKey {
+				matches = false
+				break
+			}
+		}
+		if matches {
+			return overlap
+		}
+	}
+	return 0
 }
 
 func openAIWSRawItemsHasFunctionCallOutput(items []json.RawMessage) bool {
@@ -623,9 +685,24 @@ func buildOpenAIWSReplayInputSequence(
 	if openAIWSRawItemsHasPrefix(currentItems, previousFullInput) {
 		return cloneOpenAIWSRawMessages(currentItems), true, nil
 	}
+	overlap := openAIWSReplayArtifactOverlap(previousFullInput, currentItems)
 	merged := make([]json.RawMessage, 0, len(previousFullInput)+len(currentItems))
 	merged = append(merged, cloneOpenAIWSRawMessages(previousFullInput)...)
-	merged = append(merged, cloneOpenAIWSRawMessages(currentItems)...)
+	seenReplayItems := make(map[string]struct{})
+	for _, item := range previousFullInput {
+		if key := openAIWSReplayItemDedupKey(item); key != "" {
+			seenReplayItems[key] = struct{}{}
+		}
+	}
+	for _, item := range currentItems[overlap:] {
+		if key := openAIWSReplayItemDedupKey(item); key != "" {
+			if _, seen := seenReplayItems[key]; seen {
+				continue
+			}
+			seenReplayItems[key] = struct{}{}
+		}
+		merged = append(merged, append(json.RawMessage(nil), item...))
+	}
 	return merged, true, nil
 }
 

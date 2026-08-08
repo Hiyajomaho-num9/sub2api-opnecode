@@ -25,19 +25,50 @@ func (s *OpenAIGatewayService) forwardResponsesViaRawChatCompletions(
 	body []byte,
 ) (*OpenAIForwardResult, error) {
 	startTime := time.Now()
+	compactSourceBody := body
+	explicitCompactRequest := isOpenAIResponsesCompactPath(c)
+	hasCompactionTrigger := HasCompactionTriggerInInput(body)
+	compactRequest := explicitCompactRequest || hasCompactionTrigger
+	writeFallbackError := writeOpenAIResponsesFallbackError
+	if compactRequest {
+		writeFallbackError = writeOpenAIChatFallbackCompactionError
+	}
+	if compactRequest {
+		adaptedBody, err := s.prepareChatFallbackResponsesBody(c, body, true)
+		if err != nil {
+			writeFallbackError(c, http.StatusBadRequest, "invalid_request_error", "Failed to prepare compact request")
+			return nil, fmt.Errorf("prepare chat fallback compact request: %w", err)
+		}
+		body = adaptedBody
+	} else {
+		adaptedBody, err := s.prepareChatFallbackResponsesBody(c, body, false)
+		if err != nil {
+			writeOpenAIResponsesFallbackError(c, http.StatusBadRequest, "invalid_request_error", "Failed to restore compacted context")
+			return nil, fmt.Errorf("restore chat fallback compacted context: %w", err)
+		}
+		body = adaptedBody
+	}
 
 	var responsesReq apicompat.ResponsesRequest
 	if err := json.Unmarshal(body, &responsesReq); err != nil {
-		writeOpenAIResponsesFallbackError(c, http.StatusBadRequest, "invalid_request_error", "Failed to parse request body")
+		writeFallbackError(c, http.StatusBadRequest, "invalid_request_error", "Failed to parse request body")
 		return nil, fmt.Errorf("parse responses request: %w", err)
 	}
 	originalModel := strings.TrimSpace(responsesReq.Model)
 	if originalModel == "" {
-		writeOpenAIResponsesFallbackError(c, http.StatusBadRequest, "invalid_request_error", "model is required")
+		writeFallbackError(c, http.StatusBadRequest, "invalid_request_error", "model is required")
 		return nil, fmt.Errorf("missing model in request")
 	}
 
 	clientStream := responsesReq.Stream
+	nativeRemoteCompactionV2 := compactRequest && hasCompactionTrigger && clientStream
+	if nativeRemoteCompactionV2 {
+		// Direct service tests do not pass through the handler normalizer. Marking
+		// here guarantees the compact JSON response is bridged back to SSE there
+		// as well; the handler marks it earlier in production so keepalives start.
+		MarkOpenAICompactClientStream(c)
+	}
+	clientWantsStream := clientStream || openAICompactClientWantsStream(c)
 	serviceTier := extractOpenAIServiceTierFromBody(body)
 	// custom 工具（如 codex 的 exec）降级为 function 工具转发，回程需按名字还原为
 	// custom_tool_call 项，先记下名字集合；tool_search 工具同理，回程还原为
@@ -45,7 +76,7 @@ func (s *OpenAIGatewayService) forwardResponsesViaRawChatCompletions(
 	// 为带 namespace 字段的 function_call 项。
 	effectiveTools, err := apicompat.EffectiveResponsesTools(&responsesReq)
 	if err != nil {
-		writeOpenAIResponsesFallbackError(c, http.StatusBadRequest, "invalid_request_error", err.Error())
+		writeFallbackError(c, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return nil, fmt.Errorf("resolve responses tools: %w", err)
 	}
 	customTools := apicompat.CustomToolNames(effectiveTools)
@@ -54,17 +85,34 @@ func (s *OpenAIGatewayService) forwardResponsesViaRawChatCompletions(
 
 	chatReq, err := apicompat.ResponsesToChatCompletionsRequest(&responsesReq)
 	if err != nil {
-		writeOpenAIResponsesFallbackError(c, http.StatusBadRequest, "invalid_request_error", err.Error())
+		writeFallbackError(c, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return nil, fmt.Errorf("convert responses to chat completions: %w", err)
 	}
 
 	billingModel := resolveOpenAIForwardModel(account, originalModel, "")
-	upstreamModel := normalizeOpenAIModelForUpstream(account, billingModel)
+	upstreamModel := ""
+	if explicitCompactRequest {
+		upstreamModel = resolveOpenAICompactForwardModel(account, billingModel)
+	}
+	if upstreamModel == "" || upstreamModel == billingModel {
+		upstreamModel = normalizeOpenAIModelForUpstream(account, billingModel)
+	}
 	reasoningEffort := extractOpenAIReasoningEffortFromBody(body, upstreamModel, billingModel, originalModel)
 	// 国产模型默认 effort 补充：需要 mappedModel 判定，推迟到 billingModel 算出之后。
 	reasoningEffort = ApplyThinkingEnabledFallback(reasoningEffort, body, billingModel)
 	chatReq.Model = upstreamModel
-	if clientStream {
+	upstreamStream := clientStream
+	if compactRequest {
+		// Buffer one summary completion, then expose exactly one compaction item
+		// on the Responses wire. Streaming the ordinary reasoning/message bridge
+		// is what produced Codex's "0 compaction items from 2 output items" fatal.
+		upstreamStream = false
+		chatReq.Stream = false
+		chatReq.StreamOptions = nil
+		chatReq.Tools = nil
+		chatReq.ToolChoice = nil
+		chatReq.ParallelToolCalls = nil
+	} else if clientStream {
 		chatReq.StreamOptions = &apicompat.ChatStreamOptions{IncludeUsage: true}
 	}
 
@@ -89,7 +137,8 @@ func (s *OpenAIGatewayService) forwardResponsesViaRawChatCompletions(
 		zap.String("original_model", originalModel),
 		zap.String("billing_model", billingModel),
 		zap.String("upstream_model", upstreamModel),
-		zap.Bool("stream", clientStream),
+		zap.Bool("stream", upstreamStream),
+		zap.Bool("compact", compactRequest),
 	)
 
 	// Build and send upstream request via the shared CC pipeline
@@ -97,7 +146,7 @@ func (s *OpenAIGatewayService) forwardResponsesViaRawChatCompletions(
 	if err != nil {
 		return nil, err
 	}
-	resp, err := s.sendCCUpstreamRequest(ctx, c, account, targetURL, chatBody, clientStream, apiKey, account.GetOpenAIUserAgent(), "")
+	resp, err := s.sendCCUpstreamRequest(ctx, c, account, targetURL, chatBody, upstreamStream, apiKey, account.GetOpenAIUserAgent(), "")
 	if err != nil {
 		return nil, err
 	}
@@ -108,13 +157,79 @@ func (s *OpenAIGatewayService) forwardResponsesViaRawChatCompletions(
 		if foErr := s.failoverOpenAIUpstreamHTTPError(ctx, c, account, resp, respBody, upstreamMsg, upstreamModel); foErr != nil {
 			return nil, foErr
 		}
+		if compactRequest && writeOpenAICompactSSEBridge(c, resp.StatusCode, respBody) {
+			return nil, fmt.Errorf("chat fallback compact upstream error: %d %s", resp.StatusCode, upstreamMsg)
+		}
 		return s.handleErrorResponse(ctx, resp, c, account, chatBody, billingModel)
 	}
 
+	if compactRequest {
+		return s.bufferChatCompletionsAsCompaction(c, resp, compactSourceBody, explicitCompactRequest, originalModel, "response.compaction", billingModel, upstreamModel, reasoningEffort, serviceTier, clientWantsStream, startTime)
+	}
 	if clientStream {
 		return s.streamChatCompletionsAsResponses(c, resp, originalModel, customTools, toolSearch, namespaceTools, billingModel, upstreamModel, reasoningEffort, serviceTier, startTime)
 	}
 	return s.bufferChatCompletionsAsResponses(c, resp, originalModel, customTools, toolSearch, namespaceTools, billingModel, upstreamModel, reasoningEffort, serviceTier, startTime)
+}
+
+func (s *OpenAIGatewayService) bufferChatCompletionsAsCompaction(
+	c *gin.Context,
+	resp *http.Response,
+	compactSourceBody []byte,
+	explicitCompactRequest bool,
+	originalModel string,
+	object string,
+	billingModel string,
+	upstreamModel string,
+	reasoningEffort *string,
+	serviceTier *string,
+	clientStream bool,
+	startTime time.Time,
+) (*OpenAIForwardResult, error) {
+	requestID := resp.Header.Get("x-request-id")
+	ccResp, usage, err := s.readCCUpstreamJSONResponse(c, resp, writeOpenAIChatFallbackCompactionError)
+	if err != nil {
+		return nil, err
+	}
+	compactResponse, err := s.buildChatFallbackCompactionResponse(c, compactSourceBody, explicitCompactRequest, originalModel, object, ccResp)
+	if err != nil {
+		const message = "Upstream compact completion contained no usable summary"
+		writeOpenAIChatFallbackCompactionError(c, http.StatusBadGateway, "upstream_error", message)
+		return nil, fmt.Errorf("build chat fallback compact response: %w", err)
+	}
+
+	if s.responseHeaderFilter != nil {
+		responseheaders.WriteFilteredHeaders(c.Writer.Header(), resp.Header, s.responseHeaderFilter)
+	}
+	if !writeOpenAICompactSSEBridge(c, http.StatusOK, compactResponse) {
+		c.Data(http.StatusOK, "application/json; charset=utf-8", compactResponse)
+	}
+
+	var firstTokenMs *int
+	if clientStream {
+		elapsed := int(time.Since(startTime).Milliseconds())
+		firstTokenMs = &elapsed
+	}
+	return &OpenAIForwardResult{
+		RequestID:       requestID,
+		Usage:           usage,
+		Model:           originalModel,
+		BillingModel:    billingModel,
+		UpstreamModel:   upstreamModel,
+		ReasoningEffort: reasoningEffort,
+		ServiceTier:     serviceTier,
+		Stream:          clientStream,
+		Duration:        time.Since(startTime),
+		FirstTokenMs:    firstTokenMs,
+	}, nil
+}
+
+func writeOpenAIChatFallbackCompactionError(c *gin.Context, statusCode int, errType, message string) {
+	if openAICompactClientWantsStream(c) && StopOpenAICompactSSEKeepaliveCommitted(c) {
+		writeOpenAICompactSSEFailureMessage(c, statusCode, errType, message)
+		return
+	}
+	writeOpenAIResponsesFallbackError(c, statusCode, errType, message)
 }
 
 func (s *OpenAIGatewayService) bufferChatCompletionsAsResponses(

@@ -110,15 +110,13 @@ func (c *openAIWSToolCallReplayCollector) addItem(item gjson.Result) {
 	if raw == "" || !strings.HasPrefix(raw, "{") {
 		return
 	}
-	if !isCodexToolCallContextItemType(item.Get("type").String()) {
+	itemType := strings.TrimSpace(item.Get("type").String())
+	if itemType != "reasoning" && !isCodexToolCallContextItemType(itemType) {
 		return
 	}
-	key := strings.TrimSpace(item.Get("id").String())
+	key := openAIWSReplayItemDedupKey(json.RawMessage(raw))
 	if key == "" {
-		key = strings.TrimSpace(item.Get("call_id").String())
-	}
-	if key == "" {
-		key = raw
+		key = itemType + ":raw:" + string(normalizeOpenAIWSJSONForCompareOrRaw([]byte(raw)))
 	}
 	if c.seen == nil {
 		c.seen = make(map[string]struct{})

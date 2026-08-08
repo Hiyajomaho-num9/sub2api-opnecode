@@ -316,7 +316,10 @@ func (s *OpenAIGatewayService) readCCUpstreamJSONResponse(
 	resp *http.Response,
 	writeError compatErrorWriter,
 ) (*apicompat.ChatCompletionsResponse, OpenAIUsage, error) {
-	respBody, err := ReadUpstreamResponseBody(resp.Body, s.cfg, c, openAITooLargeError)
+	writeTooLarge := func(c *gin.Context) {
+		writeError(c, http.StatusBadGateway, "upstream_error", "Upstream response too large")
+	}
+	respBody, err := ReadUpstreamResponseBody(resp.Body, s.cfg, c, writeTooLarge)
 	if err != nil {
 		if !errors.Is(err, ErrUpstreamResponseBodyTooLarge) {
 			writeError(c, http.StatusBadGateway, "api_error", "Failed to read upstream response")

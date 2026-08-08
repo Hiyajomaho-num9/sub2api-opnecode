@@ -774,6 +774,12 @@ func (h *OpenAIGatewayHandler) normalizeOpenAIResponsesCompactRequest(c *gin.Con
 	isCompactRequest := service.IsOpenAIResponsesCompactPathForTest(c)
 	if !isCompactRequest && isBareOpenAIResponsesPath(c) && service.HasCompactionTriggerInInput(body) {
 		if isOpenAIRemoteCompactionV2Request(c, body) {
+			// Keep the native v2 endpoint and wire unchanged, but mark its streaming
+			// intent before the keepalive is started. Chat-only accounts buffer a
+			// local summary and later bridge it back to exactly one compaction item;
+			// native Responses accounts simply stop the heartbeat on their first
+			// real SSE write.
+			service.MarkOpenAICompactClientStream(c)
 			return body, true
 		}
 		c.Request.URL.Path = strings.TrimRight(c.Request.URL.Path, "/") + "/compact"

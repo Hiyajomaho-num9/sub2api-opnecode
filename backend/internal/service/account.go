@@ -891,6 +891,19 @@ func (a *Account) AllowsOpenAICompact() bool {
 	return supported
 }
 
+// SupportsLocalOpenAICompactBridge reports whether this account can satisfy a
+// compact request through sub2api's Responses-to-Chat compatibility layer even
+// though its upstream does not implement /responses/compact itself.
+func (a *Account) SupportsLocalOpenAICompactBridge() bool {
+	if a == nil || !a.IsOpenAI() || a.Type != AccountTypeAPIKey {
+		return false
+	}
+	if a.GetOpenAICompactMode() == OpenAICompactModeForceOff {
+		return false
+	}
+	return !openai_compat.ShouldUseResponsesAPI(a.Extra)
+}
+
 // GetCompactModelMapping returns compact-only model remapping configuration.
 // This mapping is intended for /responses/compact only and does not affect
 // normal /responses traffic.

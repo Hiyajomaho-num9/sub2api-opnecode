@@ -646,6 +646,7 @@ func TestBufferRawChatCompletions_RejectsOversizedResponse(t *testing.T) {
 
 func rawChatCompletionsTestConfig() *config.Config {
 	return &config.Config{
+		JWT: config.JWTConfig{Secret: "unit-test-local-compact-secret"},
 		Security: config.SecurityConfig{
 			URLAllowlist: config.URLAllowlistConfig{
 				Enabled:           false,
