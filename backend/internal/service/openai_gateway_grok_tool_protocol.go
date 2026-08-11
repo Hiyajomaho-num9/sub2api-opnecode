@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"strings"
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/apicompat"
@@ -14,6 +15,48 @@ import (
 )
 
 const grokResponsesClientToolMappingContextKey = "grok_responses_client_tool_mapping"
+
+// The client-tool adapter was introduced for Grok, but the lowering is
+// protocol-level and is also useful for OpenAI-compatible Responses upstreams
+// that reject Codex custom tools.
+func adaptOpenAIResponsesClientTools(body []byte) ([]byte, apicompat.ResponsesClientToolMapping, error) {
+	return adaptGrokResponsesClientTools(body)
+}
+
+func hasOpenAIResponsesClientToolMapping(mapping apicompat.ResponsesClientToolMapping) bool {
+	return hasGrokResponsesClientToolMapping(mapping)
+}
+
+func setOpenAIResponsesClientToolMapping(c *gin.Context, mapping apicompat.ResponsesClientToolMapping) {
+	setGrokResponsesClientToolMapping(c, mapping)
+}
+
+func clearOpenAIResponsesClientToolMapping(c *gin.Context) {
+	clearGrokResponsesClientToolMapping(c)
+}
+
+func openAIResponsesClientToolMapping(c *gin.Context) (apicompat.ResponsesClientToolMapping, bool) {
+	return grokResponsesClientToolMapping(c)
+}
+
+func restoreOpenAIResponsesClientToolPayload(c *gin.Context, payload []byte) ([]byte, error) {
+	return restoreGrokResponsesClientToolPayload(c, payload)
+}
+
+func newOpenAIResponsesClientToolStreamBody(
+	source io.ReadCloser,
+	mapping apicompat.ResponsesClientToolMapping,
+	maxLineSize int,
+) io.ReadCloser {
+	return newGrokResponsesClientToolStreamBody(source, mapping, maxLineSize)
+}
+
+func isOpenAIResponsesUnsupportedCustomToolError(statusCode int, payload []byte) bool {
+	if statusCode != http.StatusBadRequest || len(payload) == 0 {
+		return false
+	}
+	return strings.Contains(strings.ToLower(string(payload)), "unsupported custom tool")
+}
 
 func adaptGrokResponsesClientTools(body []byte) ([]byte, apicompat.ResponsesClientToolMapping, error) {
 	decoder := json.NewDecoder(bytes.NewReader(body))

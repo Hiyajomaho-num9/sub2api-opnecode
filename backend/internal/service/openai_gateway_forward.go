@@ -20,7 +20,7 @@ import (
 // Forward forwards request to OpenAI API
 func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, account *Account, body []byte) (*OpenAIForwardResult, error) {
 	beginUpstreamResponseModelObservation(c)
-	clearGrokResponsesClientToolMapping(c)
+	clearOpenAIResponsesClientToolMapping(c)
 	clearOpenAIResponsesNamespaceNames(c)
 	startTime := time.Now()
 	// 固定渠道映射后的请求级 canonical body；账号 normalize/strip 不得改写跨 failover hint。
@@ -794,6 +794,7 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 	}
 
 	httpInvalidEncryptedContentRetryTried := false
+	responsesClientToolRetryTried := false
 	agentTaskRecoveryTried := false
 	rejectedFieldRetryState := newOpenAIResponsesRejectedFieldRetryState(body)
 	for {
@@ -869,6 +870,26 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 				}
 				continue
 			}
+			if !responsesClientToolRetryTried && isOpenAIResponsesUnsupportedCustomToolError(resp.StatusCode, respBody) {
+				responsesClientToolRetryTried = true
+				adaptedBody, mapping, adaptErr := adaptOpenAIResponsesClientTools(body)
+				if adaptErr != nil {
+					setOpsUpstreamError(c, http.StatusBadRequest, adaptErr.Error(), "")
+					c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{
+						"type": "invalid_request_error", "message": adaptErr.Error(), "param": "tools",
+					}})
+					return nil, adaptErr
+				}
+				if hasOpenAIResponsesClientToolMapping(mapping) && !bytes.Equal(adaptedBody, body) {
+					body = adaptedBody
+					requestView = newOpenAIRequestView(body)
+					reqBody = nil
+					setOpenAIResponsesClientToolMapping(c, mapping)
+					rejectedFieldRetryState.remember(body)
+					logger.LegacyPrintf("service.openai_gateway", "[OpenAI] Retrying non-WSv2 request with client custom tools lowered to functions (account: %s)", account.Name)
+					continue
+				}
+			}
 			respBody = s.redactAgentIdentitySensitiveBody(ctx, account, respBody)
 			resp.Body = io.NopCloser(bytes.NewReader(respBody))
 			if !httpInvalidEncryptedContentRetryTried && resp.StatusCode == http.StatusBadRequest && upstreamCode == "invalid_encrypted_content" {
@@ -927,6 +948,15 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 				)
 			}
 			return s.handleErrorResponse(ctx, resp, c, account, body, billingModel)
+		}
+		if reqStream {
+			if mapping, ok := openAIResponsesClientToolMapping(c); ok {
+				maxLineSize := defaultMaxLineSize
+				if s.cfg != nil && s.cfg.Gateway.MaxLineSize > 0 {
+					maxLineSize = s.cfg.Gateway.MaxLineSize
+				}
+				resp.Body = newOpenAIResponsesClientToolStreamBody(resp.Body, mapping, maxLineSize)
+			}
 		}
 		defer func() { _ = resp.Body.Close() }()
 
