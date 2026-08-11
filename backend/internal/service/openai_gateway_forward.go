@@ -103,6 +103,7 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 	requestView := newOpenAIRequestView(body)
 	reqModel, reqStream, promptCacheKey := requestView.Model, requestView.Stream, requestView.PromptCacheKey
 	originalModel := reqModel
+	configureOpenCodeGoReasoningSummaryCompat(c, account, body)
 
 	if account.Platform == PlatformGrok {
 		return s.forwardGrokResponses(ctx, c, account, body, originalModel, reqStream, startTime)
@@ -950,12 +951,15 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 			return s.handleErrorResponse(ctx, resp, c, account, body, billingModel)
 		}
 		if reqStream {
+			maxLineSize := defaultMaxLineSize
+			if s.cfg != nil && s.cfg.Gateway.MaxLineSize > 0 {
+				maxLineSize = s.cfg.Gateway.MaxLineSize
+			}
 			if mapping, ok := openAIResponsesClientToolMapping(c); ok {
-				maxLineSize := defaultMaxLineSize
-				if s.cfg != nil && s.cfg.Gateway.MaxLineSize > 0 {
-					maxLineSize = s.cfg.Gateway.MaxLineSize
-				}
 				resp.Body = newOpenAIResponsesClientToolStreamBody(resp.Body, mapping, maxLineSize)
+			}
+			if openCodeGoReasoningSummaryCompatEnabled(c) {
+				resp.Body = newOpenCodeGoReasoningSummaryStreamBody(resp.Body, maxLineSize)
 			}
 		}
 		defer func() { _ = resp.Body.Close() }()

@@ -1203,6 +1203,13 @@ func (s *OpenAIGatewayService) handleNonStreamingResponse(ctx context.Context, r
 	if err != nil {
 		return nil, fmt.Errorf("restore OpenAI namespace response: %w", err)
 	}
+	if openCodeGoReasoningSummaryCompatEnabled(c) {
+		if promoted, changed, promoteErr := promoteOpenCodeGoReasoningSummaryPayload(body); promoteErr != nil {
+			return nil, fmt.Errorf("promote OpenCode Go reasoning summary response: %w", promoteErr)
+		} else if changed {
+			body = promoted
+		}
+	}
 	responseheaders.WriteFilteredHeaders(c.Writer.Header(), resp.Header, s.responseHeaderFilter)
 
 	contentType := "application/json"
@@ -1282,6 +1289,13 @@ func (s *OpenAIGatewayService) handleSSEToJSON(resp *http.Response, c *gin.Conte
 			return nil, fmt.Errorf("restore OpenAI namespace response: %w", restoreErr)
 		}
 		body = restoredBody
+		if openCodeGoReasoningSummaryCompatEnabled(c) {
+			if promoted, changed, promoteErr := promoteOpenCodeGoReasoningSummaryPayload(body); promoteErr != nil {
+				return nil, fmt.Errorf("promote OpenCode Go reasoning summary response: %w", promoteErr)
+			} else if changed {
+				body = promoted
+			}
+		}
 	} else {
 		terminalType, terminalPayload, terminalOK := extractOpenAISSETerminalEvent(bodyText)
 		if terminalOK && terminalType == "response.failed" {
