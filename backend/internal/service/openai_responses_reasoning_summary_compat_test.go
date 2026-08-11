@@ -3,6 +3,8 @@ package service
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -40,7 +42,8 @@ func TestOpenCodeGoReasoningSummaryCompatPromotesNonStreamingResponse(t *testing
 	require.NotNil(t, result)
 	require.Equal(t, "summary_text", gjson.GetBytes(recorder.Body.Bytes(), "output.0.summary.0.type").String())
 	require.Equal(t, "private reasoning", gjson.GetBytes(recorder.Body.Bytes(), "output.0.summary.0.text").String())
-	require.Equal(t, "reasoning_text", gjson.GetBytes(recorder.Body.Bytes(), "output.0.content.0.type").String())
+	require.Equal(t, gjson.Null, gjson.GetBytes(recorder.Body.Bytes(), "output.0.content").Type)
+	require.True(t, strings.HasPrefix(gjson.GetBytes(recorder.Body.Bytes(), "output.0.encrypted_content").String(), openCodeGoReasoningContentPrefix))
 }
 
 func TestOpenCodeGoReasoningSummaryCompatPromotesStreamingLifecycle(t *testing.T) {
@@ -99,6 +102,8 @@ func TestOpenCodeGoReasoningSummaryCompatPromotesStreamingLifecycle(t *testing.T
 	requireGrokProtocolFrame(t, frames, "response.reasoning_summary_part.done", "part.type", "summary_text")
 	done := requireGrokProtocolFrame(t, frames, "response.output_item.done", "item.type", "reasoning")
 	require.Equal(t, "summary_text", gjson.GetBytes(done.data, "item.summary.0.type").String())
+	require.Equal(t, gjson.Null, gjson.GetBytes(done.data, "item.content").Type)
+	require.True(t, strings.HasPrefix(gjson.GetBytes(done.data, "item.encrypted_content").String(), openCodeGoReasoningContentPrefix))
 	completed := requireGrokProtocolFrame(t, frames, "response.completed", "", "")
 	require.Equal(t, "private reasoning", gjson.GetBytes(completed.data, "response.output.0.summary.0.text").String())
 	require.NotContains(t, recorder.Body.String(), "event: response.reasoning_text.delta")
@@ -114,6 +119,71 @@ func TestOpenCodeGoReasoningSummaryCompatDoesNotAffectOtherUpstreams(t *testing.
 	account.Credentials["base_url"] = "https://api.example.com/v1/responses"
 	body := []byte(`{"reasoning":{"summary":"detailed"}}`)
 	require.False(t, shouldPromoteOpenCodeGoReasoningSummary(account, body))
+}
+
+func TestOpenCodeGoReasoningSummaryCompatRestoresOpaqueReasoningOnNextRequest(t *testing.T) {
+	original := []any{map[string]any{"type": "reasoning_text", "text": "private reasoning"}}
+	rawContent, err := json.Marshal(original)
+	require.NoError(t, err)
+	body := []byte(`{
+		"model":"deepseek-v4-flash",
+		"input":[{
+			"type":"reasoning",
+			"summary":[{"type":"summary_text","text":"private reasoning"}],
+			"content":null,
+			"encrypted_content":"` + openCodeGoReasoningContentPrefix + base64.RawStdEncoding.EncodeToString(rawContent) + `"
+		}]
+	}`)
+
+	restored, changed, err := restoreOpenCodeGoReasoningContentRequest(body)
+
+	require.NoError(t, err)
+	require.True(t, changed)
+	require.Equal(t, "reasoning_text", gjson.GetBytes(restored, "input.0.content.0.type").String())
+	require.Equal(t, "private reasoning", gjson.GetBytes(restored, "input.0.content.0.text").String())
+	require.Equal(t, int64(0), gjson.GetBytes(restored, "input.0.summary.#").Int())
+	require.False(t, gjson.GetBytes(restored, "input.0.encrypted_content").Exists())
+}
+
+func TestOpenCodeGoReasoningSummaryCompatRestoresOpaqueReasoningBeforeForward(t *testing.T) {
+	original := []any{map[string]any{"type": "reasoning_text", "text": "private reasoning"}}
+	rawContent, err := json.Marshal(original)
+	require.NoError(t, err)
+	body := []byte(`{
+		"model":"deepseek-v4-flash",
+		"stream":false,
+		"reasoning":{"effort":"max","summary":"auto"},
+		"input":[{
+			"type":"reasoning",
+			"summary":[{"type":"summary_text","text":"private reasoning"}],
+			"content":null,
+			"encrypted_content":"` + openCodeGoReasoningContentPrefix + base64.RawStdEncoding.EncodeToString(rawContent) + `"
+		},{"type":"message","role":"user","content":[{"type":"input_text","text":"continue"}]}]
+	}`)
+	upstream := &httpUpstreamRecorder{responses: []*http.Response{
+		newOpenAIRejectedFieldTestResponse(http.StatusOK, `{
+			"id":"resp_next","object":"response","status":"completed","model":"deepseek-v4-flash",
+			"output":[{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"output_text","text":"done","annotations":[]}]}],
+			"usage":{"input_tokens":2,"output_tokens":1,"total_tokens":3,"input_tokens_details":{"cached_tokens":0}}
+		}`),
+	}}
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Request.Header.Set("User-Agent", "codex_vscode/test")
+
+	result, err := newOpenAIRejectedFieldTestService(upstream).Forward(
+		context.Background(), c, newOpenCodeGoReasoningSummaryTestAccount(), body,
+	)
+
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.Len(t, upstream.bodies, 1)
+	require.Equal(t, "reasoning_text", gjson.GetBytes(upstream.bodies[0], "input.0.content.0.type").String())
+	require.Equal(t, "private reasoning", gjson.GetBytes(upstream.bodies[0], "input.0.content.0.text").String())
+	require.Equal(t, int64(0), gjson.GetBytes(upstream.bodies[0], "input.0.summary.#").Int())
+	require.False(t, gjson.GetBytes(upstream.bodies[0], "input.0.encrypted_content").Exists())
 }
 
 func newOpenCodeGoReasoningSummaryTestAccount() *Account {

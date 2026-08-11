@@ -99,6 +99,16 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 		}
 	}
 
+	if isOpenCodeGoResponsesAccount(account) {
+		restoredBody, restored, restoreErr := restoreOpenCodeGoReasoningContentRequest(body)
+		if restoreErr != nil {
+			return nil, fmt.Errorf("restore OpenCode Go reasoning request: %w", restoreErr)
+		}
+		if restored {
+			body = restoredBody
+		}
+	}
+
 	originalBody := body
 	requestView := newOpenAIRequestView(body)
 	reqModel, reqStream, promptCacheKey := requestView.Model, requestView.Stream, requestView.PromptCacheKey

@@ -3,6 +3,7 @@ package service
 import (
 	"bufio"
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -14,6 +15,7 @@ import (
 )
 
 const openCodeGoReasoningSummaryCompatContextKey = "opencode_go_reasoning_summary_compat"
+const openCodeGoReasoningContentPrefix = "sub2api/opencode-go-reasoning/v1:"
 
 func configureOpenCodeGoReasoningSummaryCompat(c *gin.Context, account *Account, body []byte) {
 	if c == nil {
@@ -50,6 +52,71 @@ func isOpenCodeGoResponsesAccount(account *Account) bool {
 	}
 	path := strings.ToLower(strings.TrimRight(parsed.Path, "/"))
 	return strings.HasPrefix(path, "/zen/go/") || path == "/zen/go"
+}
+
+func restoreOpenCodeGoReasoningContentRequest(body []byte) ([]byte, bool, error) {
+	if len(body) == 0 || !json.Valid(body) {
+		return body, false, nil
+	}
+
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.UseNumber()
+	var root map[string]any
+	if err := decoder.Decode(&root); err != nil {
+		return body, false, err
+	}
+	if !restoreOpenCodeGoReasoningInput(root["input"]) {
+		return body, false, nil
+	}
+
+	restored, err := json.Marshal(root)
+	if err != nil {
+		return body, false, err
+	}
+	return restored, true, nil
+}
+
+func restoreOpenCodeGoReasoningInput(raw any) bool {
+	switch input := raw.(type) {
+	case []any:
+		changed := false
+		for _, rawItem := range input {
+			if item, ok := rawItem.(map[string]any); ok && restoreOpenCodeGoReasoningItem(item) {
+				changed = true
+			}
+		}
+		return changed
+	case map[string]any:
+		return restoreOpenCodeGoReasoningItem(input)
+	default:
+		return false
+	}
+}
+
+func restoreOpenCodeGoReasoningItem(item map[string]any) bool {
+	if strings.TrimSpace(fmt.Sprint(item["type"])) != "reasoning" {
+		return false
+	}
+	encrypted, _ := item["encrypted_content"].(string)
+	encoded := strings.TrimPrefix(encrypted, openCodeGoReasoningContentPrefix)
+	if encoded == encrypted || encoded == "" {
+		return false
+	}
+	rawContent, err := base64.RawStdEncoding.DecodeString(encoded)
+	if err != nil {
+		return false
+	}
+
+	decoder := json.NewDecoder(bytes.NewReader(rawContent))
+	decoder.UseNumber()
+	var content []any
+	if err := decoder.Decode(&content); err != nil || len(content) == 0 {
+		return false
+	}
+	item["content"] = content
+	item["summary"] = []any{}
+	delete(item, "encrypted_content")
+	return true
 }
 
 func promoteOpenCodeGoReasoningSummaryPayload(payload []byte) ([]byte, bool, error) {
@@ -146,7 +213,7 @@ func promoteOpenCodeGoReasoningOutput(raw any) bool {
 }
 
 func promoteOpenCodeGoReasoningItem(item map[string]any) bool {
-	if strings.TrimSpace(fmt.Sprint(item["type"])) != "reasoning" || openCodeGoReasoningSummaryHasText(item["summary"]) {
+	if strings.TrimSpace(fmt.Sprint(item["type"])) != "reasoning" {
 		return false
 	}
 	content, ok := item["content"].([]any)
@@ -174,8 +241,23 @@ func promoteOpenCodeGoReasoningItem(item map[string]any) bool {
 	if len(summary) == 0 {
 		return false
 	}
-	item["summary"] = summary
-	return true
+
+	changed := false
+	if !openCodeGoReasoningSummaryHasText(item["summary"]) {
+		item["summary"] = summary
+		changed = true
+	}
+	if encrypted, _ := item["encrypted_content"].(string); strings.TrimSpace(encrypted) == "" {
+		if rawContent, err := json.Marshal(content); err == nil {
+			item["encrypted_content"] = openCodeGoReasoningContentPrefix + base64.RawStdEncoding.EncodeToString(rawContent)
+			changed = true
+		}
+	}
+	if item["content"] != nil {
+		item["content"] = nil
+		changed = true
+	}
+	return changed
 }
 
 func openCodeGoReasoningSummaryHasText(raw any) bool {
