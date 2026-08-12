@@ -41,6 +41,7 @@ func TestRateLimitService_HandleUpstreamError_OpenAI403FirstHitTempUnschedulable
 		Platform: PlatformOpenAI,
 		Type:     AccountTypeOAuth,
 	}
+	startedAt := time.Now()
 
 	shouldDisable := service.HandleUpstreamError(
 		context.Background(),
@@ -58,7 +59,7 @@ func TestRateLimitService_HandleUpstreamError_OpenAI403FirstHitTempUnschedulable
 	require.Len(t, blocker.accounts, 1)
 	require.Equal(t, account.ID, blocker.accounts[0].ID)
 	require.Equal(t, "openai_403_temp", blocker.reasons[0])
-	require.True(t, blocker.until[0].After(time.Now()))
+	require.WithinDuration(t, startedAt.Add(10*time.Minute), blocker.until[0], time.Second)
 }
 
 func TestRateLimitService_HandleUpstreamError_OpenAI403ThresholdDisables(t *testing.T) {
@@ -85,4 +86,36 @@ func TestRateLimitService_HandleUpstreamError_OpenAI403ThresholdDisables(t *test
 	require.Equal(t, 0, repo.tempCalls)
 	require.Contains(t, repo.lastErrorMsg, "workspace forbidden by policy")
 	require.Contains(t, repo.lastErrorMsg, "consecutive_403=3/3")
+}
+
+func TestRateLimitService_HandleUpstreamError_OpenCodeGo403UsesOneMinuteCooldown(t *testing.T) {
+	repo := &rateLimitAccountRepoStub{}
+	counter := &openAI403CounterCacheStub{counts: []int64{1}}
+	blocker := &runtimeBlockRecorder{}
+	service := NewRateLimitService(repo, nil, &config.Config{}, nil, nil)
+	service.SetOpenAI403CounterCache(counter)
+	service.SetAccountRuntimeBlocker(blocker)
+	account := &Account{
+		ID:       303,
+		Platform: PlatformOpenAI,
+		Type:     AccountTypeAPIKey,
+		Credentials: map[string]any{
+			"base_url": "https://opencode.ai/zen/go/v1/responses",
+		},
+	}
+	startedAt := time.Now()
+
+	shouldDisable := service.HandleUpstreamError(
+		context.Background(),
+		account,
+		http.StatusForbidden,
+		http.Header{},
+		[]byte("error code: 1010"),
+	)
+
+	require.True(t, shouldDisable)
+	require.Equal(t, 1, repo.tempCalls)
+	require.WithinDuration(t, startedAt.Add(time.Minute), repo.lastTempUntil, time.Second)
+	require.Len(t, blocker.until, 1)
+	require.WithinDuration(t, startedAt.Add(time.Minute), blocker.until[0], time.Second)
 }

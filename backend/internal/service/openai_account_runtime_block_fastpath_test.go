@@ -387,6 +387,40 @@ func TestOpenAIRuntimeBlock_DoesNotShortenExistingBlock(t *testing.T) {
 	require.WithinDuration(t, longUntil, actualUntil, time.Second)
 }
 
+func TestOpenCodeGo403RuntimeBlockUsesOneMinuteCooldown(t *testing.T) {
+	repo := &rateLimitAccountRepoStub{}
+	counter := &openAI403CounterCacheStub{counts: []int64{1}}
+	rateLimitService := NewRateLimitService(repo, nil, &config.Config{}, nil, nil)
+	rateLimitService.SetOpenAI403CounterCache(counter)
+	svc := &OpenAIGatewayService{rateLimitService: rateLimitService}
+	rateLimitService.SetAccountRuntimeBlocker(svc)
+	account := &Account{
+		ID:       48,
+		Platform: PlatformOpenAI,
+		Type:     AccountTypeAPIKey,
+		Credentials: map[string]any{
+			"base_url": "https://opencode.ai/zen/go/v1/responses",
+		},
+	}
+	startedAt := time.Now()
+
+	shouldDisable := svc.handleOpenAIAccountUpstreamError(
+		context.Background(),
+		account,
+		http.StatusForbidden,
+		http.Header{},
+		[]byte("error code: 1010"),
+		"deepseek-v4-flash",
+	)
+
+	require.True(t, shouldDisable)
+	value, ok := svc.openaiAccountRuntimeBlockUntil.Load(account.ID)
+	require.True(t, ok)
+	actualUntil, ok := value.(time.Time)
+	require.True(t, ok)
+	require.WithinDuration(t, startedAt.Add(time.Minute), actualUntil, time.Second)
+}
+
 func TestOpenAIRuntimeBlock_ClearAccountSchedulingBlock(t *testing.T) {
 	svc := &OpenAIGatewayService{}
 	account := &Account{ID: 47, Platform: PlatformOpenAI, Type: AccountTypeOAuth}

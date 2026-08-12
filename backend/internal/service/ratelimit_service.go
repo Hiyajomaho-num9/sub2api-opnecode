@@ -76,6 +76,7 @@ var openAIImageTryAgainPattern = regexp.MustCompile(`(?i)try again in\s+([0-9]+(
 
 const (
 	openAI403CooldownMinutesDefault = 10
+	openCodeGo403Cooldown           = time.Minute
 	openAI403DisableThreshold       = 3
 	openAI403CounterWindowMinutes   = 180
 )
@@ -939,7 +940,7 @@ func (s *RateLimitService) handleOpenAI403(ctx context.Context, account *Account
 		return true
 	}
 
-	until := time.Now().Add(time.Duration(openAI403CooldownMinutesDefault) * time.Minute)
+	until := time.Now().Add(openAI403Cooldown(account))
 	reason := fmt.Sprintf("OpenAI 403 temporary cooldown (%d/%d): %s", count, openAI403DisableThreshold, msg)
 	s.notifyAccountSchedulingBlocked(account, until, "openai_403_temp")
 	if err := s.accountRepo.SetTempUnschedulable(ctx, account.ID, until, reason); err != nil {
@@ -956,6 +957,13 @@ func (s *RateLimitService) handleOpenAI403(ctx context.Context, account *Account
 		"threshold", openAI403DisableThreshold,
 	)
 	return true
+}
+
+func openAI403Cooldown(account *Account) time.Duration {
+	if isOpenCodeGoResponsesAccount(account) {
+		return openCodeGo403Cooldown
+	}
+	return time.Duration(openAI403CooldownMinutesDefault) * time.Minute
 }
 
 // handleAntigravity403 处理 Antigravity 平台的 403 错误

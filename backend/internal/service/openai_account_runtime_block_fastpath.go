@@ -93,7 +93,7 @@ func (s *OpenAIGatewayService) handleOpenAIAccountUpstreamError(ctx context.Cont
 	modelTempMatched := statusCode != http.StatusUnauthorized && tempUnschedulableModel(stateCtx, nil) != "" &&
 		len(matchTempUnschedulableRules(account, statusCode, responseBody)) > 0
 	if shouldDisable && !modelTempMatched {
-		s.BlockAccountScheduling(account, time.Time{}, "upstream_disable")
+		s.BlockAccountScheduling(account, openAIUpstreamDisableRuntimeUntil(account, statusCode), "upstream_disable")
 	}
 	// Pool-mode retryable upstream errors are already bounded by the request-local
 	// same-account retry budget. Recording the generic account+model transient
@@ -117,6 +117,13 @@ func (s *OpenAIGatewayService) handleOpenAIAccountUpstreamError(ctx context.Cont
 		}
 	}
 	return shouldDisable
+}
+
+func openAIUpstreamDisableRuntimeUntil(account *Account, statusCode int) time.Time {
+	if statusCode == http.StatusForbidden && isOpenCodeGoResponsesAccount(account) {
+		return time.Now().Add(openCodeGo403Cooldown)
+	}
+	return time.Time{}
 }
 
 func shouldCooldownOpenAITransientUpstreamError(statusCode int, responseBody []byte) bool {
