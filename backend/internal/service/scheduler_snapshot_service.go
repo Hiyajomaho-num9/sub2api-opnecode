@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -44,6 +45,10 @@ type batchSeenKey struct {
 type schedulerBucketWriteTask struct {
 	bucket SchedulerBucket
 	token  SchedulerBucketWriteToken
+}
+
+type schedulerSnapshotCandidateRepository interface {
+	ListSchedulerSnapshotCandidates(ctx context.Context, groupID *int64, platform string, includeGrouped bool) ([]Account, error)
 }
 
 type schedulerAccountQueryKey struct {
@@ -1462,6 +1467,9 @@ func (s *SchedulerSnapshotService) loadAccountsFromDB(ctx context.Context, bucke
 	if s.isRunModeSimple() {
 		groupID = 0
 	}
+	if !useMixed && bucket.Platform == PlatformOpenAI {
+		return s.loadOpenAISnapshotAccountsFromDB(ctx, groupID)
+	}
 
 	if useMixed {
 		platforms := []string{bucket.Platform, PlatformAntigravity}
@@ -1494,6 +1502,71 @@ func (s *SchedulerSnapshotService) loadAccountsFromDB(ctx context.Context, bucke
 		return s.accountRepo.ListSchedulableByPlatform(ctx, bucket.Platform)
 	}
 	return s.accountRepo.ListSchedulableUngroupedByPlatform(ctx, bucket.Platform)
+}
+
+// OpenCode Go uses a short, durable 403 cooldown. Keep that account in the
+// snapshot while it cools down so IsSchedulable can restore it exactly when
+// the timestamp expires instead of waiting for the next full rebuild.
+func (s *SchedulerSnapshotService) loadOpenAISnapshotAccountsFromDB(ctx context.Context, groupID int64) ([]Account, error) {
+	provider, ok := s.accountRepo.(schedulerSnapshotCandidateRepository)
+	if !ok {
+		if groupID > 0 {
+			return s.accountRepo.ListSchedulableByGroupIDAndPlatform(ctx, groupID, PlatformOpenAI)
+		}
+		if s.isRunModeSimple() {
+			return s.accountRepo.ListSchedulableByPlatform(ctx, PlatformOpenAI)
+		}
+		return s.accountRepo.ListSchedulableUngroupedByPlatform(ctx, PlatformOpenAI)
+	}
+
+	var scopedGroupID *int64
+	includeGrouped := false
+	if s.isRunModeSimple() {
+		includeGrouped = true
+	} else if groupID > 0 {
+		scopedGroupID = &groupID
+	}
+
+	accounts, err := provider.ListSchedulerSnapshotCandidates(ctx, scopedGroupID, PlatformOpenAI, includeGrouped)
+	if err != nil {
+		return nil, err
+	}
+
+	filtered := make([]Account, 0, len(accounts))
+	for i := range accounts {
+		account := &accounts[i]
+		if isSchedulerSnapshotRuntimeEligible(account) || retainOpenCodeGo403CooldownInSnapshot(account) {
+			filtered = append(filtered, *account)
+		}
+	}
+	return filtered, nil
+}
+
+func isSchedulerSnapshotRuntimeEligible(account *Account) bool {
+	if account == nil || !account.IsActive() || !account.Schedulable {
+		return false
+	}
+	now := time.Now()
+	if account.AutoPauseOnExpired && account.ExpiresAt != nil && !now.Before(*account.ExpiresAt) {
+		return false
+	}
+	if account.OverloadUntil != nil && now.Before(*account.OverloadUntil) {
+		return false
+	}
+	if account.RateLimitResetAt != nil && now.Before(*account.RateLimitResetAt) {
+		return false
+	}
+	return account.TempUnschedulableUntil == nil || !now.Before(*account.TempUnschedulableUntil)
+}
+
+func retainOpenCodeGo403CooldownInSnapshot(account *Account) bool {
+	if !isOpenCodeGoResponsesAccount(account) || account.TempUnschedulableUntil == nil {
+		return false
+	}
+	if !time.Now().Before(*account.TempUnschedulableUntil) {
+		return false
+	}
+	return strings.HasPrefix(account.TempUnschedulableReason, "OpenAI 403 temporary cooldown (")
 }
 
 func (s *SchedulerSnapshotService) loadAccountsForRebuild(

@@ -2121,6 +2121,19 @@ func (r *accountRepository) ListModelAvailabilityCandidates(
 	return r.accountsToService(ctx, accounts)
 }
 
+// ListSchedulerSnapshotCandidates returns the persistently enabled account
+// pool for snapshot construction. The snapshot service reapplies runtime state
+// and may retain narrowly scoped timed cooldowns that must recover without a
+// full-rebuild delay.
+func (r *accountRepository) ListSchedulerSnapshotCandidates(
+	ctx context.Context,
+	groupID *int64,
+	platform string,
+	includeGrouped bool,
+) ([]service.Account, error) {
+	return r.ListModelAvailabilityCandidates(ctx, groupID, []string{platform}, includeGrouped)
+}
+
 func (r *accountRepository) SetRateLimited(ctx context.Context, id int64, resetAt time.Time) error {
 	now := time.Now()
 	_, err := r.client.Account.Update().
