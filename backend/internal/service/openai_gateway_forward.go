@@ -1169,6 +1169,10 @@ func (s *OpenAIGatewayService) buildUpstreamRequest(ctx context.Context, c *gin.
 		req.Header.Set("accept", "application/json")
 	}
 
+	// OpenCode Go's Cloudflare edge rejects some third-party client signatures.
+	// Normalize the default identity while preserving explicit administrator overrides.
+	applyOpenCodeGoDefaultUserAgent(req.Header, account)
+
 	// Apply custom User-Agent if configured
 	customUA := account.GetOpenAIUserAgent()
 	if customUA != "" {

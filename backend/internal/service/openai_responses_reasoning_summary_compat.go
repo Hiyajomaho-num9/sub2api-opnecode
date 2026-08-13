@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"net/url"
 	"strings"
 
@@ -16,6 +17,17 @@ import (
 
 const openCodeGoReasoningSummaryCompatContextKey = "opencode_go_reasoning_summary_compat"
 const openCodeGoReasoningContentPrefix = "sub2api/opencode-go-reasoning/v1:"
+const openCodeGoDefaultUserAgent = "opencode/1.0.0"
+
+func applyOpenCodeGoDefaultUserAgent(headers http.Header, account *Account) {
+	if headers == nil || !isOpenCodeGoResponsesAccount(account) {
+		return
+	}
+	if strings.TrimSpace(account.GetOpenAIUserAgent()) != "" {
+		return
+	}
+	headers.Set("user-agent", openCodeGoDefaultUserAgent)
+}
 
 func configureOpenCodeGoReasoningSummaryCompat(c *gin.Context, account *Account, body []byte) {
 	if c == nil {

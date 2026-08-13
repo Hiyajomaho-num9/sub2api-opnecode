@@ -205,6 +205,10 @@ func (s *OpenAIGatewayService) sendCCUpstreamRequest(
 	if userAgent != "" {
 		upstreamReq.Header.Set("user-agent", userAgent)
 	}
+	applyOpenCodeGoDefaultUserAgent(upstreamReq.Header, account)
+	if s.cfg != nil && s.cfg.Gateway.ForceCodexCLI {
+		upstreamReq.Header.Set("user-agent", codexCLIUserAgent)
+	}
 
 	if account.Platform == PlatformGrok {
 		if account.IsGrokOAuth() {

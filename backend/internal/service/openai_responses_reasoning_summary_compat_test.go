@@ -13,6 +13,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/gjson"
@@ -186,6 +187,105 @@ func TestOpenCodeGoReasoningSummaryCompatRestoresOpaqueReasoningBeforeForward(t 
 	require.Equal(t, "private reasoning", gjson.GetBytes(upstream.bodies[0], "input.0.content.0.text").String())
 	require.Equal(t, int64(0), gjson.GetBytes(upstream.bodies[0], "input.0.summary.#").Int())
 	require.False(t, gjson.GetBytes(upstream.bodies[0], "input.0.encrypted_content").Exists())
+}
+
+func TestApplyOpenCodeGoDefaultUserAgent(t *testing.T) {
+	t.Run("normalizes third-party client identity", func(t *testing.T) {
+		account := newOpenCodeGoReasoningSummaryTestAccount()
+		headers := http.Header{"User-Agent": []string{"oai-compatible-copilot/0.4.2 VSCode/1.133.0"}}
+
+		applyOpenCodeGoDefaultUserAgent(headers, account)
+
+		require.Equal(t, openCodeGoDefaultUserAgent, headers.Get("User-Agent"))
+	})
+
+	t.Run("preserves explicit account override", func(t *testing.T) {
+		account := newOpenCodeGoReasoningSummaryTestAccount()
+		account.Credentials["user_agent"] = "custom-opencode-client/2.0"
+		headers := http.Header{"User-Agent": []string{"client/1.0"}}
+
+		applyOpenCodeGoDefaultUserAgent(headers, account)
+
+		require.Equal(t, "client/1.0", headers.Get("User-Agent"))
+	})
+
+	t.Run("leaves other upstreams untouched", func(t *testing.T) {
+		account := newOpenCodeGoReasoningSummaryTestAccount()
+		account.Credentials["base_url"] = "https://api.example.com/v1/responses"
+		headers := http.Header{"User-Agent": []string{"client/1.0"}}
+
+		applyOpenCodeGoDefaultUserAgent(headers, account)
+
+		require.Equal(t, "client/1.0", headers.Get("User-Agent"))
+	})
+}
+
+func TestOpenCodeGoUserAgentAppliedAcrossTransports(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	body := []byte(`{"model":"deepseek-v4-flash","input":"hello","stream":false}`)
+	newContext := func() *gin.Context {
+		rec := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(rec)
+		c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
+		c.Request.Header.Set("User-Agent", "oai-compatible-copilot/0.4.2 VSCode/1.133.0")
+		return c
+	}
+	newService := func(forceCodex bool) *OpenAIGatewayService {
+		return &OpenAIGatewayService{cfg: &config.Config{
+			Gateway: config.GatewayConfig{ForceCodexCLI: forceCodex},
+			Security: config.SecurityConfig{
+				URLAllowlist: config.URLAllowlistConfig{Enabled: false},
+			},
+		}}
+	}
+
+	t.Run("responses", func(t *testing.T) {
+		c := newContext()
+		req, err := newService(false).buildUpstreamRequest(
+			c.Request.Context(), c, newOpenCodeGoReasoningSummaryTestAccount(), body, "token", false, "", false,
+		)
+		require.NoError(t, err)
+		require.Equal(t, openCodeGoDefaultUserAgent, req.Header.Get("User-Agent"))
+	})
+
+	t.Run("passthrough", func(t *testing.T) {
+		c := newContext()
+		req, err := newService(false).buildUpstreamRequestOpenAIPassthrough(
+			c.Request.Context(), c, newOpenCodeGoReasoningSummaryTestAccount(), body, "token",
+		)
+		require.NoError(t, err)
+		require.Equal(t, openCodeGoDefaultUserAgent, req.Header.Get("User-Agent"))
+	})
+
+	t.Run("websocket", func(t *testing.T) {
+		c := newContext()
+		headers, _, err := newService(false).buildOpenAIWSHeaders(
+			c.Request.Context(), c, newOpenCodeGoReasoningSummaryTestAccount(), "token",
+			OpenAIWSProtocolDecision{Transport: OpenAIUpstreamTransportResponsesWebsocketV2},
+			false, "", "", "", "deepseek-v4-flash", "",
+		)
+		require.NoError(t, err)
+		require.Equal(t, openCodeGoDefaultUserAgent, headers.Get("User-Agent"))
+	})
+
+	t.Run("chat fallback honors force codex", func(t *testing.T) {
+		c := newContext()
+		upstream := &httpUpstreamRecorder{resp: &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{}`)),
+		}}
+		svc := newService(true)
+		svc.httpUpstream = upstream
+
+		resp, err := svc.sendCCUpstreamRequest(
+			c.Request.Context(), c, newOpenCodeGoReasoningSummaryTestAccount(),
+			"https://opencode.ai/zen/go/v1/chat/completions", body, false, "token", "", "",
+		)
+		require.NoError(t, err)
+		require.NotNil(t, resp)
+		require.Equal(t, codexCLIUserAgent, upstream.lastReq.Header.Get("User-Agent"))
+	})
 }
 
 func newOpenCodeGoReasoningSummaryTestAccount() *Account {
