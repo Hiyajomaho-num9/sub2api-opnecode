@@ -103,6 +103,10 @@ const (
 	// credentials["openai_capabilities"] 配置集。仅用于生图意图的 /v1/responses
 	// 调度，避免把请求调度到会在 forward 阶段被降级为 Chat Completions 的账号（#4417）。
 	OpenAIEndpointCapabilityResponses OpenAIEndpointCapability = "responses"
+	// OpenAIEndpointCapabilityCompaction accepts either a native Responses
+	// upstream or an API-key account served by sub2api's local Responses-to-Chat
+	// compaction bridge. It must not be used for ordinary Responses requests.
+	OpenAIEndpointCapabilityCompaction OpenAIEndpointCapability = "compaction"
 )
 
 const openAIEndpointCapabilitiesCredentialKey = "openai_capabilities"
@@ -1505,6 +1509,12 @@ func (a *Account) SupportsOpenAIEndpointCapability(capability OpenAIEndpointCapa
 			a.Type == AccountTypeOAuth &&
 			!a.IsOpenAIPersonalAccessToken() &&
 			!a.IsOpenAIAgentIdentity()
+	case OpenAIEndpointCapabilityCompaction:
+		if a.SupportsLocalOpenAICompactBridge() {
+			capability = OpenAIEndpointCapabilityChatCompletions
+			break
+		}
+		fallthrough
 	case OpenAIEndpointCapabilityResponses:
 		// Responses 支持状态由 accounts.extra 的自动探测标记决定，而非
 		// credentials 能力集。已探测确认不支持 /v1/responses 的 APIKey 上游
